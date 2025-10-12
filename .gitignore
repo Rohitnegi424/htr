@@ -1,0 +1,19 @@
+# Ignore dataset folders and processed data
+iam_words/
+processed_data/
+
+# Ignore large model files
+*.npz
+*.h5
+*.keras
+*.ckpt
+
+# Ignore Python cache and logs
+__pycache__/
+*.log
+*.tmp
+.env
+.DS_Store
+
+# Ignore system files
+Thumbs.db
