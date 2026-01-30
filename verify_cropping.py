@@ -9,20 +9,22 @@ import os
 # =========================================================
 IMG_HEIGHT = 32
 MAX_WIDTH = 256
-MODEL_PATH = r"D:/project/htr_ctc_words_multilang_best.keras"
-DATA_PATH = r"D:/project/processed_data/data.npz"
-CROPPED_WORDS_DIR = r"D:/project/cropped_words"  # folder to save cropped word images
 
-os.makedirs(CROPPED_WORDS_DIR, exist_ok=True)
+MODEL_PATH = r"D:/project/htr_ctc_words_multilang_best.keras"
+DATA_PATH  = r"D:/project/processed_data/data.npz"
+PARAGRAPH_IMAGE = r"D:\project\test\a01-000u.png\a01-000u.png"
+
+CROPPED_DIR = r"D:/project/cropped_words"
+os.makedirs(CROPPED_DIR, exist_ok=True)
 
 # =========================================================
-# DUMMY CTC LOSS (REQUIRED FOR LOADING)
+# DUMMY CTC LOSS (ONLY FOR MODEL LOADING)
 # =========================================================
 def ctc_loss(args):
     return args[0]
 
 # =========================================================
-# LOAD CHARSET
+# LOAD CHARSET (MUST MATCH TRAINING)
 # =========================================================
 data = np.load(DATA_PATH, allow_pickle=True)
 texts = data["labels"]
@@ -34,7 +36,7 @@ blank_idx = len(charset)
 print("Charset size:", len(charset))
 
 # =========================================================
-# LOAD MODEL
+# LOAD MODEL (INFERENCE ONLY)
 # =========================================================
 full_model = tf.keras.models.load_model(
     MODEL_PATH,
@@ -53,35 +55,48 @@ infer_model = tf.keras.models.Model(
 print("Inference model loaded successfully.")
 
 # =========================================================
-# PREPROCESS WORD IMAGE
+# WORD PREPROCESSING (MATCH TRAINING)
 # =========================================================
 def preprocess_word(img):
-    if img is None:
-        raise ValueError("Invalid image")
+    if img is None or img.size == 0:
+        raise ValueError("Invalid word image")
 
     img = img.astype(np.float32) / 255.0
     h, w = img.shape
+
     scale = IMG_HEIGHT / h
     new_w = max(1, min(int(w * scale), MAX_WIDTH))
+
     img = cv2.resize(img, (new_w, IMG_HEIGHT))
+
     padded = np.zeros((IMG_HEIGHT, MAX_WIDTH), dtype=np.float32)
     padded[:, :new_w] = img
-    padded = np.expand_dims(padded, axis=-1)
-    padded = np.expand_dims(padded, axis=0)
+
+    padded = padded[..., np.newaxis]
+    padded = padded[np.newaxis, ...]
+
     time_steps = max(1, new_w // 4)
     return padded, time_steps
 
 # =========================================================
-# CTC DECODER
+# CTC GREEDY DECODER
 # =========================================================
 def ctc_decode(preds, input_len):
     preds = preds[:, :input_len, :]
-    decoded, _ = tf.keras.backend.ctc_decode(preds, input_length=[input_len], greedy=True)
+    decoded, _ = tf.keras.backend.ctc_decode(
+        preds,
+        input_length=[input_len],
+        greedy=True
+    )
     return decoded[0].numpy()[0]
 
-def predict_word(img):
-    img_prep, time_steps = preprocess_word(img)
-    preds = infer_model.predict(img_prep, verbose=0)
+# =========================================================
+# WORD PREDICTION
+# =========================================================
+def predict_word(word_img):
+    img, time_steps = preprocess_word(word_img)
+    preds = infer_model.predict(img, verbose=0)
+
     seq = ctc_decode(preds, time_steps)
 
     text = ""
@@ -93,51 +108,109 @@ def predict_word(img):
     return unicodedata.normalize("NFC", text)
 
 # =========================================================
-# SEGMENT WORDS
+# LINE-AWARE WORD SEGMENTATION (STABLE)
 # =========================================================
 def segment_words(paragraph_img):
     gray = cv2.cvtColor(paragraph_img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    _, thresh = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
     dilated = cv2.dilate(thresh, kernel, iterations=1)
 
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    word_imgs = []
-    boxes = []
+    contours, _ = cv2.findContours(
+        dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    words = []
 
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if w > 5 and h > 5:
-            word_img = gray[y:y+h, x:x+w]
-            word_imgs.append(word_img)
-            boxes.append((x, y, w, h))
 
-    boxes, word_imgs = zip(*sorted(zip(boxes, word_imgs), key=lambda b: (b[0][1], b[0][0])))
-    return word_imgs, boxes
+        if w < 10 or h < 10:
+            continue
+
+        # ---- SAFE PADDING (IMPORTANT) ----
+        pad_y = int(0.15 * h)
+        pad_x = 2
+
+        y1 = max(0, y - pad_y)
+        y2 = min(gray.shape[0], y + h + pad_y)
+        x1 = max(0, x - pad_x)
+        x2 = min(gray.shape[1], x + w + pad_x)
+
+        crop = gray[y1:y2, x1:x2]
+        words.append((x1, y1, w, h, crop))
+
+    # ---- SORT TOP TO BOTTOM ----
+    words.sort(key=lambda b: b[1])
+
+    # ---- GROUP INTO LINES ----
+    lines = []
+    line_thresh = 25
+
+    for x, y, w, h, crop in words:
+        cy = y + h // 2
+        placed = False
+
+        for line in lines:
+            if abs(cy - line["cy"]) < line_thresh:
+                line["items"].append((x, y, w, h, crop))
+                line["cy"] = int(np.mean(
+                    [b[1] + b[3] // 2 for b in line["items"]]
+                ))
+                placed = True
+                break
+
+        if not placed:
+            lines.append({
+                "cy": cy,
+                "items": [(x, y, w, h, crop)]
+            })
+
+    # ---- SORT LINES AND WORDS ----
+    lines.sort(key=lambda l: l["cy"])
+
+    ordered_words = []
+    for line in lines:
+        line["items"].sort(key=lambda b: b[0])  # left → right
+        ordered_words.extend(line["items"])
+
+    return ordered_words
 
 # =========================================================
-# PREDICT PARAGRAPH
+# PARAGRAPH PREDICTION
 # =========================================================
-def predict_paragraph(paragraph_img, save_crops=True):
-    words, boxes = segment_words(paragraph_img)
+def predict_paragraph(img_path):
+    img = cv2.imread(img_path)
+    if img is None:
+        raise ValueError("Could not read paragraph image")
+
+    words = segment_words(img)
+
     predictions = []
 
-    for i, word in enumerate(words):
-        pred = predict_word(word)
+    for i, (_, _, _, _, word_img) in enumerate(words):
+        if word_img.shape[1] < 15:
+            continue
+
+        pred = predict_word(word_img)
         predictions.append(pred)
 
-        if save_crops:
-            crop_path = os.path.join(CROPPED_WORDS_DIR, f"word_{i}_{pred}.png")
-            cv2.imwrite(crop_path, word)
+        cv2.imwrite(
+            os.path.join(CROPPED_DIR, f"word_{i:03d}_{pred}.png"),
+            word_img
+        )
 
     return " ".join(predictions)
 
 # =========================================================
-# TEST
+# RUN
 # =========================================================
 if __name__ == "__main__":
-    paragraph_image = cv2.imread(r"D:\project\test\a01-000u.png\a01-000u.png")
-    text = predict_paragraph(paragraph_image, save_crops=True)
-    print("Predicted paragraph:")
-    print(text)
-    print(f"Cropped words saved in: {CROPPED_WORDS_DIR}")
+    print("\nPredicted paragraph:\n")
+    print(predict_paragraph(PARAGRAPH_IMAGE))
+    print("\nCropped words saved to:", CROPPED_DIR)
