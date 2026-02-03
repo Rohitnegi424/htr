@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 import unicodedata
 import os
+import re
 
 # =========================================================
 # CONFIG
@@ -12,14 +13,27 @@ MAX_WIDTH = 256
 
 MODEL_PATH = r"D:/project/htr_ctc_words_multilang_best.keras"
 DATA_PATH  = r"D:/project/processed_data/data.npz"
-
-PARAGRAPH_IMAGE = r"D:\project\test\a01-000u.png\a01-000u.png"
+PARAGRAPH_IMAGE = r"D:\project\test\a1.png"
 
 CROPPED_DIR = r"D:/project/cropped_words"
 os.makedirs(CROPPED_DIR, exist_ok=True)
 
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+if not os.path.exists(DATA_PATH):
+    raise FileNotFoundError(f"Data not found: {DATA_PATH}")
+
 # =========================================================
-# DUMMY CTC LOSS (ONLY FOR LOADING)
+# CROPPED OUTPUT CLEANUP
+# =========================================================
+def clear_cropped_dir():
+    for name in os.listdir(CROPPED_DIR):
+        p = os.path.join(CROPPED_DIR, name)
+        if os.path.isfile(p):
+            os.remove(p)
+
+# =========================================================
+# DUMMY CTC LOSS (ONLY FOR MODEL LOADING)
 # =========================================================
 def ctc_loss(args):
     return args[0]
@@ -80,6 +94,13 @@ def preprocess_word(img):
     return padded, time_steps
 
 # =========================================================
+# SAFE FILENAME
+# =========================================================
+def sanitize_filename(text):
+    # Replace characters that are invalid on Windows/macOS/Linux
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_") or "blank"
+
+# =========================================================
 # CTC GREEDY DECODER
 # =========================================================
 def ctc_decode(preds, input_len):
@@ -97,6 +118,7 @@ def ctc_decode(preds, input_len):
 def predict_word(word_img):
     img, time_steps = preprocess_word(word_img)
     preds = infer_model.predict(img, verbose=0)
+
     seq = ctc_decode(preds, time_steps)
 
     text = ""
@@ -108,61 +130,113 @@ def predict_word(word_img):
     return unicodedata.normalize("NFC", text)
 
 # =========================================================
-# LINE-AWARE WORD SEGMENTATION
+# LINE-AWARE WORD SEGMENTATION (STABLE)
 # =========================================================
 def segment_words(paragraph_img):
+    # Contour-based word segmentation tuned to training (word-level crops)
     gray = cv2.cvtColor(paragraph_img, cv2.COLOR_BGR2GRAY)
 
-    _, thresh = cv2.threshold(
-        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    # Binarize (text -> white)
+    _, bin_inv = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
     )
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-    dilated = cv2.dilate(thresh, kernel, iterations=1)
+    # Remove small speckles
+    bin_inv = cv2.morphologyEx(
+        bin_inv,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+        iterations=1
+    )
 
+    # Estimate typical character height to scale morphology
     contours, _ = cv2.findContours(
-        dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        bin_inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    heights = [cv2.boundingRect(c)[3] for c in contours if cv2.boundingRect(c)[2] >= 3]
+    med_h = int(np.median(heights)) if heights else 20
+    med_h = max(12, min(med_h, 80))
+
+    # Connect characters into words (horizontal emphasis)
+    kx = max(12, int(med_h * 0.8))
+    ky = max(3, int(med_h * 0.25))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+    connected = cv2.dilate(bin_inv, kernel, iterations=1)
+
+    # Find word contours on connected mask
+    word_contours, _ = cv2.findContours(
+        connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     words = []
-    for cnt in contours:
+    for cnt in word_contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if w > 5 and h > 5:
-            crop = gray[y:y+h, x:x+w]
-            words.append((x, y, w, h, crop))
 
-    # sort by vertical position
-    words.sort(key=lambda b: b[1])
+        # Filter tiny boxes
+        if w < max(12, int(med_h * 0.6)) or h < max(10, int(med_h * 0.5)):
+            continue
 
-    # group into lines
+        # Padding based on height
+        pad_y = int(0.18 * h)
+        pad_x = int(0.08 * h)
+
+        y1 = max(0, y - pad_y)
+        y2 = min(gray.shape[0], y + h + pad_y)
+        x1 = max(0, x - pad_x)
+        x2 = min(gray.shape[1], x + w + pad_x)
+
+        crop = gray[y1:y2, x1:x2]
+        pw = x2 - x1
+        ph = y2 - y1
+
+        # Skip low-ink crops
+        ink = np.mean(bin_inv[y1:y2, x1:x2] > 0)
+        if ink < 0.03:
+            continue
+
+        words.append((x1, y1, pw, ph, crop))
+
+    # If nothing found, fall back to raw contours
+    if not words:
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w < 10 or h < 10:
+                continue
+            pad_y = int(0.15 * h)
+            pad_x = 2
+            y1 = max(0, y - pad_y)
+            y2 = min(gray.shape[0], y + h + pad_y)
+            x1 = max(0, x - pad_x)
+            x2 = min(gray.shape[1], x + w + pad_x)
+            crop = gray[y1:y2, x1:x2]
+            pw = x2 - x1
+            ph = y2 - y1
+            words.append((x1, y1, pw, ph, crop))
+
+    # Sort top to bottom then left to right
+    words.sort(key=lambda b: (b[1], b[0]))
+
+    # Group into lines for proper ordering
+    ordered_words = []
+    line_thresh = max(10, int(np.median([h for _, _, _, h, _ in words]) * 0.6)) if words else 10
     lines = []
-    line_thresh = 25
 
     for x, y, w, h, crop in words:
         cy = y + h // 2
         placed = False
-
         for line in lines:
             if abs(cy - line["cy"]) < line_thresh:
                 line["items"].append((x, y, w, h, crop))
-                line["cy"] = int(np.mean(
-                    [b[1] + b[3] // 2 for b in line["items"]]
-                ))
+                line["cy"] = int(np.mean([b[1] + b[3] // 2 for b in line["items"]]))
                 placed = True
                 break
-
         if not placed:
-            lines.append({
-                "cy": cy,
-                "items": [(x, y, w, h, crop)]
-            })
+            lines.append({"cy": cy, "items": [(x, y, w, h, crop)]})
 
-    # sort lines top to bottom
     lines.sort(key=lambda l: l["cy"])
-
-    ordered_words = []
     for line in lines:
-        line["items"].sort(key=lambda b: b[0])  # left to right
+        line["items"].sort(key=lambda b: b[0])
         ordered_words.extend(line["items"])
 
     return ordered_words
@@ -171,6 +245,7 @@ def segment_words(paragraph_img):
 # PARAGRAPH PREDICTION
 # =========================================================
 def predict_paragraph(img_path):
+    clear_cropped_dir()
     img = cv2.imread(img_path)
     if img is None:
         raise ValueError("Could not read paragraph image")
@@ -178,12 +253,17 @@ def predict_paragraph(img_path):
     words = segment_words(img)
 
     predictions = []
+
     for i, (_, _, _, _, word_img) in enumerate(words):
+        if word_img.shape[1] < 15:
+            continue
+
         pred = predict_word(word_img)
         predictions.append(pred)
 
+        safe_pred = sanitize_filename(pred)
         cv2.imwrite(
-            os.path.join(CROPPED_DIR, f"word_{i:03d}_{pred}.png"),
+            os.path.join(CROPPED_DIR, f"word_{i:03d}_{safe_pred}.png"),
             word_img
         )
 
