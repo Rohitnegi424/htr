@@ -1,0 +1,42 @@
+
+body {
+  font-family: Arial;
+  background: #0f172a;
+  color: white;
+}
+
+.container {
+  max-width: 600px;
+  margin: auto;
+  text-align: center;
+  padding: 20px;
+}
+
+.upload-box {
+  border: 2px dashed #38bdf8;
+  padding: 20px;
+  margin-bottom: 15px;
+}
+
+button {
+  padding: 10px 15px;
+  margin: 5px;
+  border: none;
+  background: #38bdf8;
+  color: black;
+  cursor: pointer;
+}
+
+.cancel {
+  background: #ef4444;
+}
+
+.result-box {
+  margin-top: 20px;
+  background: #1e293b;
+  padding: 15px;
+}
+
+.controls {
+  margin-top: 15px;
+}
